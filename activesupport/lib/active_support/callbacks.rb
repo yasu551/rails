@@ -99,45 +99,49 @@ module ActiveSupport
       if callbacks.empty?
         yield if block_given?
       else
-        env = Filters::Environment.new(self, false, nil)
+        env = Filters.environment_pool.acquire(self)
 
-        next_sequence = callbacks.compile(type)
+        begin
+          next_sequence = callbacks.compile(type)
 
-        # Common case: no 'around' callbacks defined
-        if next_sequence.final?
-          next_sequence.invoke_before(env)
-          env.value = !env.halted && (!block_given? || yield)
-          next_sequence.invoke_after(env)
-          env.value
-        else
-          invoke_sequence = Proc.new do
-            skipped = nil
+          # Common case: no 'around' callbacks defined
+          if next_sequence.final?
+            next_sequence.invoke_before(env)
+            env.value = !env.halted && (!block_given? || yield)
+            next_sequence.invoke_after(env)
+            env.value
+          else
+            invoke_sequence = Proc.new do
+              skipped = nil
 
-            while true
-              current = next_sequence
-              current.invoke_before(env)
-              if current.final?
-                env.value = !env.halted && (!block_given? || yield)
-              elsif current.skip?(env)
-                (skipped ||= []) << current
-                next_sequence = next_sequence.nested
-                next
-              else
-                next_sequence = next_sequence.nested
-                begin
-                  target, block, method, *arguments = current.expand_call_template(env, invoke_sequence)
-                  target.send(method, *arguments, &block)
-                ensure
-                  next_sequence = current
+              while true
+                current = next_sequence
+                current.invoke_before(env)
+                if current.final?
+                  env.value = !env.halted && (!block_given? || yield)
+                elsif current.skip?(env)
+                  (skipped ||= []) << current
+                  next_sequence = next_sequence.nested
+                  next
+                else
+                  next_sequence = next_sequence.nested
+                  begin
+                    target, block, method, *arguments = current.expand_call_template(env, invoke_sequence)
+                    target.send(method, *arguments, &block)
+                  ensure
+                    next_sequence = current
+                  end
                 end
+                current.invoke_after(env)
+                skipped.pop.invoke_after(env) while skipped&.first
+                break env.value
               end
-              current.invoke_after(env)
-              skipped.pop.invoke_after(env) while skipped&.first
-              break env.value
             end
-          end
 
-          invoke_sequence.call
+            invoke_sequence.call
+          end
+        ensure
+          Filters.environment_pool.release(env) if env
         end
       end
     end
@@ -160,6 +164,95 @@ module ActiveSupport
 
       module Filters # :nodoc: all
         Environment = Struct.new(:target, :halted, :value)
+
+        # Object pool for Environment instances to reduce memory allocations
+        class EnvironmentPool
+          POOL_SIZE = 50
+          
+          def initialize
+            @pool = Array.new(POOL_SIZE) { Environment.new(nil, false, nil) }
+            @index = 0
+            @mutex = Mutex.new
+          end
+
+          def acquire(target, halted = false, value = nil)
+            env = @mutex.synchronize do
+              if @index < @pool.size
+                env = @pool[@index]
+                @index += 1
+                env
+              else
+                Environment.new(nil, false, nil)
+              end
+            end
+            
+            env.target = target
+            env.halted = halted
+            env.value = value
+            env
+          end
+
+          def release(env)
+            @mutex.synchronize do
+              if @index > 0
+                @index -= 1
+                @pool[@index] = env
+                env.target = nil
+                env.halted = false
+                env.value = nil
+              end
+            end
+          end
+
+          private_constant :POOL_SIZE
+        end
+
+        @environment_pool = EnvironmentPool.new
+        
+        def self.environment_pool
+          @environment_pool
+        end
+
+        # Cache for compiled invoke sequences to reduce Proc allocation
+        @invoke_sequence_cache = {}
+        @cache_mutex = Mutex.new
+        
+        def self.get_invoke_sequence_proc
+          @invoke_sequence_cache[:default] ||= @cache_mutex.synchronize do
+            @invoke_sequence_cache[:default] ||= Proc.new do |env, callbacks, next_sequence|
+              skipped = nil
+
+              while true
+                current = next_sequence
+                current.invoke_before(env)
+                if current.final?
+                  env.value = !env.halted && (!block_given? || yield)
+                elsif current.skip?(env)
+                  (skipped ||= []) << current
+                  next_sequence = next_sequence.nested
+                  next
+                else
+                  next_sequence = next_sequence.nested
+                  begin
+                    target, block, method, *arguments = current.expand_call_template(env, callbacks)
+                    target.send(method, *arguments, &block)
+                  ensure
+                    next_sequence = current
+                  end
+                end
+                current.invoke_after(env)
+                skipped.pop.invoke_after(env) while skipped&.first
+                break env.value
+              end
+            end
+          end
+        end
+
+        def self.clear_invoke_sequence_cache
+          @cache_mutex.synchronize do
+            @invoke_sequence_cache.clear
+          end
+        end
 
         class Before
           def initialize(user_callback, user_conditions, chain_config, filter, name)
@@ -240,7 +333,7 @@ module ActiveSupport
         end
 
         attr_accessor :kind, :name
-        attr_reader :chain_config, :filter
+        attr_reader :chain_config, :filter, :user_conditions
 
         def initialize(name, filter, kind, options, chain_config)
           @chain_config = chain_config
@@ -249,6 +342,7 @@ module ActiveSupport
           @filter  = filter
           @if      = check_conditionals(options[:if])
           @unless  = check_conditionals(options[:unless])
+          @user_conditions = @if + @unless
 
           compiled
         end
@@ -556,11 +650,41 @@ module ActiveSupport
         end
 
         def invoke_before(arg)
-          @before&.each { |b| b.call(arg) }
+          return unless @before
+          
+          # Unroll loops for common cases to reduce method call overhead
+          case @before.size
+          when 1
+            @before[0].call(arg)
+          when 2
+            @before[0].call(arg)
+            @before[1].call(arg)
+          when 3
+            @before[0].call(arg)
+            @before[1].call(arg)
+            @before[2].call(arg)
+          else
+            @before.each { |b| b.call(arg) }
+          end
         end
 
         def invoke_after(arg)
-          @after&.each { |a| a.call(arg) }
+          return unless @after
+          
+          # Unroll loops for common cases to reduce method call overhead
+          case @after.size
+          when 1
+            @after[0].call(arg)
+          when 2
+            @after[0].call(arg)
+            @after[1].call(arg)
+          when 3
+            @after[0].call(arg)
+            @after[1].call(arg)
+            @after[2].call(arg)
+          else
+            @after.each { |a| a.call(arg) }
+          end
         end
       end
 
@@ -586,14 +710,12 @@ module ActiveSupport
         def empty?;       @chain.empty?; end
 
         def insert(index, o)
-          @all_callbacks = nil
-          @single_callbacks.clear
+          invalidate_cache_for_callback(o)
           @chain.insert(index, o)
         end
 
         def delete(o)
-          @all_callbacks = nil
-          @single_callbacks.clear
+          invalidate_cache_for_callback(o)
           @chain.delete(o)
         end
 
@@ -614,17 +736,11 @@ module ActiveSupport
         def compile(type)
           if type.nil?
             @all_callbacks || @mutex.synchronize do
-              final_sequence = CallbackSequence.new
-              @all_callbacks ||= @chain.reverse.inject(final_sequence) do |callback_sequence, callback|
-                callback.apply(callback_sequence)
-              end
+              @all_callbacks ||= build_callback_sequence(@chain)
             end
           else
             @single_callbacks[type] || @mutex.synchronize do
-              final_sequence = CallbackSequence.new
-              @single_callbacks[type] ||= @chain.reverse.inject(final_sequence) do |callback_sequence, callback|
-                type == callback.kind ? callback.apply(callback_sequence) : callback_sequence
-              end
+              @single_callbacks[type] ||= build_callback_sequence(@chain, type)
             end
           end
         end
@@ -642,23 +758,57 @@ module ActiveSupport
 
         private
           def append_one(callback)
-            @all_callbacks = nil
-            @single_callbacks.clear
+            invalidate_cache_for_callback(callback)
             remove_duplicates(callback)
             @chain.push(callback)
           end
 
           def prepend_one(callback)
-            @all_callbacks = nil
-            @single_callbacks.clear
+            invalidate_cache_for_callback(callback)
             remove_duplicates(callback)
             @chain.unshift(callback)
           end
 
           def remove_duplicates(callback)
-            @all_callbacks = nil
-            @single_callbacks.clear
+            invalidate_cache_for_callback(callback)
             @chain.delete_if { |c| callback.duplicates?(c) }
+          end
+
+          # Granular cache invalidation based on callback type
+          def invalidate_cache_for_callback(callback)
+            if callback && callback.respond_to?(:kind)
+              # Only invalidate caches for the specific callback type
+              @single_callbacks.delete(callback.kind)
+              # Only invalidate all_callbacks if it affects the overall chain
+              @all_callbacks = nil if affects_overall_chain?(callback)
+            else
+              # Fallback to full invalidation for unknown callback types
+              @all_callbacks = nil
+              @single_callbacks.clear
+            end
+          end
+
+          # Determine if callback affects the overall execution chain
+          def affects_overall_chain?(callback)
+            # Around callbacks affect overall execution flow
+            callback.kind == :around || 
+            # Callbacks with conditions might affect flow
+            (callback.respond_to?(:user_conditions) && !callback.user_conditions.empty?)
+          end
+
+          # Optimized callback sequence building without intermediate objects
+          def build_callback_sequence(chain, filter_type = nil)
+            final_sequence = CallbackSequence.new
+            
+            # Forward iteration instead of reverse.inject to avoid intermediate arrays
+            (chain.length - 1).downto(0) do |i|
+              callback = chain[i]
+              if filter_type.nil? || callback.kind == filter_type
+                final_sequence = callback.apply(final_sequence)
+              end
+            end
+            
+            final_sequence
           end
 
           def default_terminator
